@@ -41,7 +41,8 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v6
 
-    - name: Set up Go 1.x
+    # The Go version comes from go.mod (1.27), the same as the CI workflow.
+    - name: Set up Go
       uses: actions/setup-go@v6
       with:
         go-version-file: './go.mod'

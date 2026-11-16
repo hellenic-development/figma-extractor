@@ -15,19 +15,24 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        go_version: [1.26.x]
     steps:
 
     - name: Check out code into the Go module directory
       uses: actions/checkout@v6
 
-    - name: Set up Go 1.x
+    # The Go version comes from go.mod, so the module and CI never disagree.
+    - name: Set up Go
       uses: actions/setup-go@v6
       with:
-        go-version: ${{ matrix.go_version }}
+        go-version-file: './go.mod'
+        check-latest: true
     - run: go version
 
+    - name: Format
+      run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+    - name: Vet
+      run: go vet ./...
+
     - name: Test
-      run: go test -v ./...
+      run: go test -race -count=1 ./...

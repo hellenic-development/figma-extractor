@@ -1,460 +1,580 @@
 package figma
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
+// DefaultBaseURL is Figma's REST API.
+const DefaultBaseURL = "https://api.figma.com/v1"
+
 const (
-	figmaAPIBase = "https://api.figma.com/v1"
+	defaultMaxRetryWait = 30 * time.Second
+	defaultTimeout      = 10 * time.Minute
+	defaultBackoff      = time.Second
+	maxAttempts         = 3
+	errorBodyLimit      = 8 << 10
 )
 
-// Client represents a Figma API client with configured HTTP settings for reliable communication
-// with the Figma API. It includes retry logic and optimized transport settings for handling large files.
+// Client talks to Figma's REST API with a personal access token.
+//
+// Every call takes a context and ends with it, waits included. Figma meters
+// requests in three tiers, and the expensive one (reading a file or nodes,
+// rendering images) is as low as a handful of calls a month on a View seat,
+// so the client counts what it sends (Requests) and never retries a rate
+// limit it cannot wait out.
 type Client struct {
-	accessToken string
-	httpClient  *http.Client
+	token        string
+	base         string
+	http         *http.Client
+	maxRetryWait time.Duration
+	maxBody      int64
+	timeout      time.Duration
+	backoff      time.Duration
+
+	tier1, tier2, tier3 atomic.Int64
 }
 
-// NewClient creates a new Figma API client with the provided personal access token.
-// The client is configured with optimized HTTP transport settings including connection pooling,
-// disabled HTTP/2 (for large file stability), and a 10-minute timeout for very large files.
-func NewClient(accessToken string) *Client {
-	// Configure transport for better handling of large files
-	transport := &http.Transport{
-		MaxIdleConns:        10,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		DisableKeepAlives:   false,
-		MaxIdleConnsPerHost: 10,
-		// Disable HTTP/2 to avoid stream errors with large files
-		ForceAttemptHTTP2: false,
-	}
+// Option configures a Client.
+type Option func(*Client)
 
-	return &Client{
-		accessToken: accessToken,
-		httpClient: &http.Client{
-			Timeout:   10 * time.Minute, // Increased timeout for very large files
-			Transport: transport,
-		},
+// WithHTTPClient sets the HTTP client. The default one honours the proxy
+// environment variables and has no timeout of its own.
+func WithHTTPClient(h *http.Client) Option {
+	return func(c *Client) {
+		if h != nil {
+			c.http = h
+		}
 	}
 }
 
-// ExtractFileKey extracts the unique file identifier from a Figma URL.
-// Supports both /file/ and /design/ URL patterns (e.g., figma.com/file/ABC123/Design-Name).
-// Returns an error if the URL format is invalid or if the URL doesn't match the expected Figma domain pattern.
-func ExtractFileKey(figmaURL string) (string, error) {
-	// Match patterns like:
-	// https://www.figma.com/file/ABC123/Design-Name
-	// https://www.figma.com/design/ABC123/Design-Name
-	// Anchored to ensure the entire URL matches the expected pattern and prevent bypass attacks.
-	re := regexp.MustCompile(`^https?://(?:www\.)?figma\.com/(?:file|design)/([A-Za-z0-9]+)(?:/|$)`)
-	matches := re.FindStringSubmatch(figmaURL)
-
-	if len(matches) < 2 {
-		return "", fmt.Errorf("invalid Figma URL format: must be a valid figma.com URL with /file/ or /design/ path")
+// WithBaseURL points the client at another API root, a test server for
+// instance.
+func WithBaseURL(base string) Option {
+	return func(c *Client) {
+		if base = strings.TrimRight(base, "/"); base != "" {
+			c.base = base
+		}
 	}
-
-	return matches[1], nil
 }
 
-// ExtractNodeIDs extracts node identifiers from a Figma URL.
-// Supports multiple formats:
-//   - Query parameter: ?node-id=123:456 or ?node-id=123-456 or ?node-id=123:456,789:012
-//   - Hash fragment: #123:456 or #123:456,789:012
-//   - Path format: /nodes/123:456 or /nodes/123:456,789:012
-//
-// Returns an empty slice if no node IDs are found (not an error).
-// Normalizes URL-encoded colons (123-456 → 123:456).
-func ExtractNodeIDs(figmaURL string) ([]string, error) {
-	nodeIDs := make([]string, 0)
-
-	// Try query parameter format: ?node-id=123:456 or ?node-id=123-456
-	queryRe := regexp.MustCompile(`[?&]node-id=([^&]+)`)
-	if matches := queryRe.FindStringSubmatch(figmaURL); len(matches) >= 2 {
-		// Split by comma for multiple nodes
-		ids := strings.Split(matches[1], ",")
-		for _, id := range ids {
-			// Normalize: replace URL-encoded dash with colon
-			id = strings.ReplaceAll(strings.TrimSpace(id), "-", ":")
-			if id != "" {
-				nodeIDs = append(nodeIDs, id)
-			}
-		}
-		return deduplicateNodeIDs(nodeIDs), nil
-	}
-
-	// Try hash fragment format: #123:456 or #123:456,789:012
-	hashRe := regexp.MustCompile(`#([0-9:-]+(?:,[0-9:-]+)*)`)
-	if matches := hashRe.FindStringSubmatch(figmaURL); len(matches) >= 2 {
-		ids := strings.Split(matches[1], ",")
-		for _, id := range ids {
-			id = strings.TrimSpace(id)
-			if id != "" {
-				nodeIDs = append(nodeIDs, id)
-			}
-		}
-		return deduplicateNodeIDs(nodeIDs), nil
-	}
-
-	// Try path format: /nodes/123:456 or /nodes/123:456,789:012
-	pathRe := regexp.MustCompile(`/nodes/([0-9:-]+(?:,[0-9:-]+)*)`)
-	if matches := pathRe.FindStringSubmatch(figmaURL); len(matches) >= 2 {
-		ids := strings.Split(matches[1], ",")
-		for _, id := range ids {
-			id = strings.TrimSpace(id)
-			if id != "" {
-				nodeIDs = append(nodeIDs, id)
-			}
-		}
-		return deduplicateNodeIDs(nodeIDs), nil
-	}
-
-	// No node IDs found - return empty slice (not an error)
-	return nodeIDs, nil
+// WithMaxRetryWait sets the longest Retry-After the client waits out itself
+// (30 seconds by default). A longer one comes back as the error, so the
+// caller can say when the allowance frees instead of hanging until then.
+func WithMaxRetryWait(d time.Duration) Option {
+	return func(c *Client) { c.maxRetryWait = d }
 }
 
-// deduplicateNodeIDs removes duplicate node IDs while preserving order.
-func deduplicateNodeIDs(nodeIDs []string) []string {
-	seen := make(map[string]bool)
-	result := make([]string, 0, len(nodeIDs))
-
-	for _, id := range nodeIDs {
-		if !seen[id] {
-			seen[id] = true
-			result = append(result, id)
-		}
-	}
-
-	return result
+// WithMaxBodyBytes caps the JSON body the client reads. 0, the default, is
+// no cap.
+func WithMaxBodyBytes(n int64) Option {
+	return func(c *Client) { c.maxBody = n }
 }
 
-// GetFile retrieves complete file data from the Figma API including document structure, styles, and metadata.
-// Implements automatic retry logic (up to 3 attempts) with exponential backoff for handling rate limits
-// and temporary failures. The request automatically retries on 429 (rate limit) and 5xx (server error) responses.
-func (c *Client) GetFile(fileKey string) (*FileResponse, error) {
-	url := fmt.Sprintf("%s/files/%s", figmaAPIBase, fileKey)
-
-	var lastErr error
-	maxRetries := 3
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		req.Header.Set("X-Figma-Token", c.accessToken)
-		// Disable HTTP/2 to avoid stream errors with large files
-		req.Header.Set("Connection", "close")
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d failed to execute request: %w", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-			if attempt < maxRetries && (resp.StatusCode == 429 || resp.StatusCode >= 500) {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d failed to read response body: %w", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		var fileResp FileResponse
-		if err := json.Unmarshal(body, &fileResp); err != nil {
-			return nil, fmt.Errorf("failed to parse response: %w", err)
-		}
-
-		return &fileResp, nil
-	}
-
-	return nil, lastErr
+// WithTimeout bounds a call or a download whose context has no deadline (10
+// minutes by default, since a large file takes Figma minutes to serialise).
+// 0 leaves it unbounded.
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) { c.timeout = d }
 }
 
-// GetFileNodes retrieves specific nodes from a Figma file by their node IDs.
-// This is more efficient than fetching the entire file when you only need specific elements.
-// Implements automatic retry logic (up to 3 attempts) with exponential backoff for handling rate limits.
-// Parameters:
-//   - fileKey: The Figma file identifier
-//   - nodeIDs: Slice of node IDs to fetch (e.g., ["123:456", "789:012"])
-//
-// Returns a NodesResponse containing the requested nodes with their complete structure.
-func (c *Client) GetFileNodes(fileKey string, nodeIDs []string) (*NodesResponse, error) {
-	if len(nodeIDs) == 0 {
-		return nil, fmt.Errorf("no node IDs provided")
+// NewClient returns a client for the given personal access token.
+func NewClient(token string, opts ...Option) *Client {
+	c := &Client{
+		token:        strings.TrimSpace(token),
+		base:         DefaultBaseURL,
+		maxRetryWait: defaultMaxRetryWait,
+		timeout:      defaultTimeout,
+		backoff:      defaultBackoff,
 	}
-
-	// Join node IDs with comma for the API request
-	idsParam := strings.Join(nodeIDs, ",")
-	url := fmt.Sprintf("%s/files/%s/nodes?ids=%s", figmaAPIBase, fileKey, idsParam)
-
-	var lastErr error
-	maxRetries := 3
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		req.Header.Set("X-Figma-Token", c.accessToken)
-		req.Header.Set("Connection", "close")
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d failed to execute request: %w", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-			if attempt < maxRetries && (resp.StatusCode == 429 || resp.StatusCode >= 500) {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d failed to read response body: %w", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		var nodesResp NodesResponse
-		if err := json.Unmarshal(body, &nodesResp); err != nil {
-			return nil, fmt.Errorf("failed to parse response: %w", err)
-		}
-
-		// Verify that all requested nodes were returned
-		if len(nodesResp.Nodes) == 0 {
-			return nil, fmt.Errorf("no nodes found for the provided IDs: %s", idsParam)
-		}
-
-		// Check for nodes that weren't found
-		missingNodes := make([]string, 0)
-		for _, id := range nodeIDs {
-			if _, exists := nodesResp.Nodes[id]; !exists {
-				missingNodes = append(missingNodes, id)
-			}
-		}
-
-		if len(missingNodes) > 0 {
-			return nil, fmt.Errorf("nodes not found: %s", strings.Join(missingNodes, ", "))
-		}
-
-		return &nodesResp, nil
+	for _, opt := range opts {
+		opt(c)
 	}
-
-	return nil, lastErr
+	if c.http == nil {
+		// A clone of the default transport keeps its proxy lookup, keep-alives
+		// and HTTP/2, without sharing its connection pool with the host app.
+		// A host that wrapped the default transport (tracing, a test double)
+		// gets its wrapper used as it is: there is nothing to clone.
+		transport := http.DefaultTransport
+		if base, ok := transport.(*http.Transport); ok {
+			transport = base.Clone()
+		}
+		c.http = &http.Client{Transport: transport}
+	}
+	return c
 }
 
-// GetImages retrieves rendered images for the specified nodes from the Figma Images API.
-// Supports format (png, svg, jpg, pdf) and scale factor for raster formats.
-// Implements automatic retry logic (up to 3 attempts) with exponential backoff.
-func (c *Client) GetImages(fileKey string, nodeIDs []string, format string, scale float64) (*ImageResponse, error) {
-	if len(nodeIDs) == 0 {
-		return nil, fmt.Errorf("no node IDs provided")
-	}
-
-	if format == "" {
-		format = "png"
-	}
-	if scale <= 0 {
-		scale = 1
-	}
-
-	idsParam := strings.Join(nodeIDs, ",")
-	url := fmt.Sprintf("%s/images/%s?ids=%s&format=%s&scale=%g", figmaAPIBase, fileKey, idsParam, format, scale)
-
-	var lastErr error
-	maxRetries := 3
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		req.Header.Set("X-Figma-Token", c.accessToken)
-		req.Header.Set("Connection", "close")
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d failed to execute request: %w", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-			if attempt < maxRetries && (resp.StatusCode == 429 || resp.StatusCode >= 500) {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d failed to read response body: %w", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		var imgResp ImageResponse
-		if err := json.Unmarshal(body, &imgResp); err != nil {
-			return nil, fmt.Errorf("failed to parse response: %w", err)
-		}
-
-		if imgResp.Err != nil {
-			return nil, fmt.Errorf("Figma images API error: %s", *imgResp.Err)
-		}
-
-		return &imgResp, nil
-	}
-
-	return nil, lastErr
+// RequestStats counts the requests a client has sent, retries included, by
+// Figma's rate-limit tier.
+type RequestStats struct {
+	Tier1 int // file, nodes, image renders
+	Tier2 int // image fills and the like
+	Tier3 int // metadata
 }
 
-// GetFileImages retrieves download URLs for all embedded images in a Figma file.
-// Calls GET /v1/files/:key/images and returns a map of imageRef -> download URL.
-// Implements automatic retry logic (up to 3 attempts) with exponential backoff.
-func (c *Client) GetFileImages(fileKey string) (*FileImagesResponse, error) {
-	url := fmt.Sprintf("%s/files/%s/images", figmaAPIBase, fileKey)
-
-	var lastErr error
-	maxRetries := 3
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		req.Header.Set("X-Figma-Token", c.accessToken)
-		req.Header.Set("Connection", "close")
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d failed to execute request: %w", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-			if attempt < maxRetries && (resp.StatusCode == 429 || resp.StatusCode >= 500) {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d failed to read response body: %w", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			return nil, lastErr
-		}
-
-		var imgResp FileImagesResponse
-		if err := json.Unmarshal(body, &imgResp); err != nil {
-			return nil, fmt.Errorf("failed to parse response: %w", err)
-		}
-
-		if imgResp.Err != nil {
-			return nil, fmt.Errorf("Figma file images API error: %s", *imgResp.Err)
-		}
-
-		return &imgResp, nil
-	}
-
-	return nil, lastErr
+// Requests returns what the client has sent so far.
+func (c *Client) Requests() RequestStats {
+	return RequestStats{Tier1: int(c.tier1.Load()), Tier2: int(c.tier2.Load()), Tier3: int(c.tier3.Load())}
 }
 
-// GetFileStyles retrieves all published styles (colors, text, effects, grids) from a Figma file.
-// This includes style metadata such as names, descriptions, and type information.
-func (c *Client) GetFileStyles(fileKey string) (*StylesResponse, error) {
-	url := fmt.Sprintf("%s/files/%s/styles", figmaAPIBase, fileKey)
+// tierOf is the rate-limit tier of an API path, per Figma's rate limit table.
+func tierOf(endpoint string) int {
+	switch {
+	case strings.HasPrefix(endpoint, "/images/"):
+		return 1
+	case strings.HasPrefix(endpoint, "/files/"):
+		rest := strings.Split(strings.TrimPrefix(endpoint, "/files/"), "/")
+		if len(rest) == 1 {
+			return 1
+		}
+		switch rest[1] {
+		case "nodes":
+			return 1
+		case "meta", "styles", "components", "component_sets":
+			return 3
+		default:
+			return 2
+		}
+	default:
+		return 3
+	}
+}
 
-	req, err := http.NewRequest("GET", url, nil)
+func (c *Client) count(endpoint string) {
+	switch tierOf(endpoint) {
+	case 1:
+		c.tier1.Add(1)
+	case 2:
+		c.tier2.Add(1)
+	default:
+		c.tier3.Add(1)
+	}
+}
+
+// Get sends one GET to the API and decodes the JSON answer into out. path
+// starts with a slash and may already carry a query; query is added to it.
+// It is the door for a caller that decodes into its own types; File, Nodes,
+// Images and ImageFills are built on it.
+func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
+	endpoint := path
+	if i := strings.IndexByte(endpoint, '?'); i >= 0 {
+		endpoint = endpoint[:i]
+	}
+	target := c.base + path
+	if len(query) > 0 {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		target += sep + query.Encode()
+	}
+
+	if _, ok := ctx.Deadline(); !ok && c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+
+	for attempt := 1; ; attempt++ {
+		err := c.once(ctx, endpoint, target, out)
+		if err == nil {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("the Figma request was stopped: %w", ctxErr)
+		}
+		wait, retry := c.retryWait(err, attempt)
+		if !retry || attempt == maxAttempts {
+			return err
+		}
+		// A wait the context will not live through is not started: the
+		// caller would get "deadline exceeded" and lose what Figma said,
+		// the rate limit and when it frees above all.
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < wait {
+			return err
+		}
+		if err := sleep(ctx, wait); err != nil {
+			return fmt.Errorf("the Figma request was stopped: %w", err)
+		}
+	}
+}
+
+// permanentError marks a failure another attempt cannot fix.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// retryWait decides whether err is worth another attempt and how long to
+// wait first. A rate limit is waited out only when Figma says it frees
+// within the ceiling: a View seat's monthly allowance can answer with days.
+func (c *Client) retryWait(err error, attempt int) (time.Duration, bool) {
+	if _, ok := errors.AsType[*permanentError](err); ok {
+		return 0, false
+	}
+	backoff := c.backoff << (attempt - 1)
+	apiErr, ok := AsAPIError(err)
+	if !ok {
+		return backoff, true // could not reach Figma, or the body was cut
+	}
+	switch apiErr.Kind {
+	case KindRateLimited:
+		if apiErr.RetryAfter == 0 {
+			return backoff, true
+		}
+		if apiErr.RetryAfter <= c.maxRetryWait {
+			return apiErr.RetryAfter, true
+		}
+		return 0, false
+	case KindServer:
+		return backoff, true
+	default:
+		return 0, false
+	}
+}
+
+func (c *Client) once(ctx context.Context, endpoint, target string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return &permanentError{err}
 	}
+	req.Header.Set("X-Figma-Token", c.token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "figma-extractor/"+Version)
 
-	req.Header.Set("X-Figma-Token", c.accessToken)
-
-	resp, err := c.httpClient.Do(req)
+	c.count(endpoint)
+	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
+		return fmt.Errorf("could not reach Figma: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
+		return newAPIError(endpoint, resp.StatusCode, resp.Header, body)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Decoded straight off the wire: no second copy of a body that can run
+	// to hundreds of megabytes.
+	body := &cappedReader{r: resp.Body, left: c.maxBody, unlimited: c.maxBody <= 0}
+	if err := json.NewDecoder(body).Decode(out); err != nil {
+		if body.exceeded {
+			return &permanentError{fmt.Errorf("the answer from Figma for %s is larger than the %d MB limit", endpoint, c.maxBody>>20)}
+		}
+		var syntaxErr *json.SyntaxError
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+			return &permanentError{fmt.Errorf("could not read Figma's answer for %s: %w", endpoint, err)}
+		}
+		return fmt.Errorf("could not read Figma's answer for %s: %w", endpoint, err)
+	}
+	return nil
+}
+
+// cappedReader stops with an error once more than its allowance was read.
+type cappedReader struct {
+	r         io.Reader
+	left      int64
+	unlimited bool
+	exceeded  bool
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if c.unlimited {
+		return c.r.Read(p)
+	}
+	if c.left <= 0 {
+		// One more byte than allowed means the body is over the cap.
+		var probe [1]byte
+		if n, _ := c.r.Read(probe[:]); n > 0 {
+			c.exceeded = true
+			return 0, errors.New("body over the size cap")
+		}
+		return 0, io.EOF
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.r.Read(p)
+	c.left -= int64(n)
+	return n, err
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// FileQuery narrows GET /v1/files/:key.
+type FileQuery struct {
+	// IDs keeps only these nodes, their children and their ancestors.
+	IDs []string
+	// Depth is how many levels below the document to return: 1 is the
+	// pages, 2 adds each page's top-level layers. 0 is the whole tree.
+	Depth int
+	// Geometry asks for vector path data.
+	Geometry bool
+}
+
+// File reads a file. Without a Depth it returns the whole document, which
+// for a large file is slow and large: prefer Nodes with the frames you need.
+func (c *Client) File(ctx context.Context, fileKey string, q FileQuery) (*FileResponse, error) {
+	query := url.Values{}
+	if ids := NormalizeNodeIDs(q.IDs); len(ids) > 0 {
+		query.Set("ids", strings.Join(ids, ","))
+	}
+	if q.Depth > 0 {
+		query.Set("depth", strconv.Itoa(q.Depth))
+	}
+	if q.Geometry {
+		query.Set("geometry", "paths")
+	}
+	var out FileResponse
+	if err := c.Get(ctx, "/files/"+url.PathEscape(fileKey), query, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// NodesQuery narrows GET /v1/files/:key/nodes.
+type NodesQuery struct {
+	// Depth is how many levels below each requested node to return. 0 is
+	// the whole subtree.
+	Depth int
+	// Geometry asks for vector path data.
+	Geometry bool
+}
+
+// Nodes reads the given nodes with their subtrees. The ids may be in any
+// form; the answer is keyed by the colon form and holds nil for an id the
+// file does not have (see NodesResponse.Missing).
+func (c *Client) Nodes(ctx context.Context, fileKey string, ids []string, q NodesQuery) (*NodesResponse, error) {
+	ids = NormalizeNodeIDs(ids)
+	if len(ids) == 0 {
+		return nil, errors.New("no node ids given")
+	}
+	query := url.Values{"ids": {strings.Join(ids, ",")}}
+	if q.Depth > 0 {
+		query.Set("depth", strconv.Itoa(q.Depth))
+	}
+	if q.Geometry {
+		query.Set("geometry", "paths")
+	}
+	var out NodesResponse
+	if err := c.Get(ctx, "/files/"+url.PathEscape(fileKey)+"/nodes", query, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ImageQuery shapes a render.
+type ImageQuery struct {
+	// Format is png (the default), jpg, svg or pdf.
+	Format string
+	// Scale is between 0.01 and 4 and applies to png and jpg. 0 means 1.
+	Scale float64
+	// UseAbsoluteBounds renders the node's full box even where it is empty
+	// or cropped, which keeps a text node from being trimmed.
+	UseAbsoluteBounds bool
+}
+
+// Images asks Figma to render the given nodes and returns a download URL
+// per node id. The URL is empty for a node Figma could not render. The
+// URLs live for 30 days. Figma renders at most 32 megapixels and scales a
+// larger node down.
+func (c *Client) Images(ctx context.Context, fileKey string, ids []string, q ImageQuery) (map[string]string, error) {
+	ids = NormalizeNodeIDs(ids)
+	if len(ids) == 0 {
+		return nil, errors.New("no node ids given")
+	}
+	format := strings.ToLower(q.Format)
+	if format == "" {
+		format = "png"
+	}
+	query := url.Values{"ids": {strings.Join(ids, ",")}, "format": {format}}
+	if format == "png" || format == "jpg" {
+		scale := q.Scale
+		if scale <= 0 {
+			scale = 1
+		}
+		query.Set("scale", strconv.FormatFloat(scale, 'g', -1, 64))
+	}
+	if q.UseAbsoluteBounds {
+		query.Set("use_absolute_bounds", "true")
+	}
+	endpoint := "/images/" + url.PathEscape(fileKey)
+	var out ImageResponse
+	if err := c.Get(ctx, endpoint, query, &out); err != nil {
+		return nil, err
+	}
+	if out.Err != nil && *out.Err != "" {
+		return nil, &APIError{Status: http.StatusOK, Kind: KindRenderFailed, Message: *out.Err, Endpoint: endpoint}
+	}
+	return out.Images, nil
+}
+
+// ImageFills returns a download URL for every picture used as a fill in the
+// file, keyed by the imageRef a Paint carries. These are the original
+// uploads, not renders. The URLs live for up to 14 days.
+func (c *Client) ImageFills(ctx context.Context, fileKey string) (map[string]string, error) {
+	var out FileImagesResponse
+	if err := c.Get(ctx, "/files/"+url.PathEscape(fileKey)+"/images", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Meta.Images, nil
+}
+
+// Downloaded describes a file Download wrote.
+type Downloaded struct {
+	Path  string
+	MIME  string // sniffed from the first bytes, "image/png" for example
+	Bytes int64
+}
+
+// Download saves a URL Figma handed out (a render or an image fill) to dest.
+// The bytes go to a temporary file beside dest that is renamed over it only
+// when the download is whole, so a stopped or failed download leaves
+// nothing behind. maxBytes, when above 0, refuses a larger file. The token
+// is not sent: these URLs are pre-signed and go to a storage host.
+func (c *Client) Download(ctx context.Context, rawURL, dest string, maxBytes int64) (Downloaded, error) {
+	// Bounded like an API call when the caller set no deadline: a storage
+	// host that stalls mid-file must not hold the caller forever.
+	if _, ok := ctx.Deadline(); !ok && c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	const attempts = 2
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		got, retry, err := c.downloadOnce(ctx, rawURL, dest, maxBytes)
+		if err == nil {
+			return got, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Downloaded{}, fmt.Errorf("the download was stopped: %w", ctxErr)
+		}
+		lastErr = err
+		if !retry || attempt == attempts {
+			break
+		}
+		if err := sleep(ctx, c.backoff); err != nil {
+			return Downloaded{}, fmt.Errorf("the download was stopped: %w", err)
+		}
+	}
+	return Downloaded{}, lastErr
+}
+
+func (c *Client) downloadOnce(ctx context.Context, rawURL, dest string, maxBytes int64) (got Downloaded, retry bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return Downloaded{}, false, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Downloaded{}, true, fmt.Errorf("could not download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return Downloaded{}, resp.StatusCode >= 500, fmt.Errorf("the download answered status %d", resp.StatusCode)
 	}
 
-	var stylesResp StylesResponse
-	if err := json.Unmarshal(body, &stylesResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	dir := filepath.Dir(dest)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return Downloaded{}, false, err
 	}
+	tmp, err := os.CreateTemp(dir, ".figma-*.part")
+	if err != nil {
+		return Downloaded{}, false, err
+	}
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		tmp.Close()
+		if !keep {
+			os.Remove(tmpPath)
+		}
+	}()
 
-	return &stylesResp, nil
+	var body io.Reader = resp.Body
+	if maxBytes > 0 {
+		body = io.LimitReader(resp.Body, maxBytes+1)
+	}
+	buffered := bufio.NewReaderSize(body, 32<<10)
+	head, _ := buffered.Peek(512)
+	mime := sniffMIME(head)
+
+	n, err := io.Copy(tmp, buffered)
+	if err != nil {
+		return Downloaded{}, true, fmt.Errorf("could not save the download: %w", err)
+	}
+	if maxBytes > 0 && n > maxBytes {
+		return Downloaded{}, false, fmt.Errorf("the file is larger than the %d MB limit", maxBytes>>20)
+	}
+	if err := tmp.Close(); err != nil {
+		return Downloaded{}, false, err
+	}
+	if err := os.Rename(tmpPath, dest); err != nil {
+		return Downloaded{}, false, err
+	}
+	keep = true
+	return Downloaded{Path: dest, MIME: mime, Bytes: n}, false, nil
+}
+
+// sniffMIME names the type of a file from its first bytes. An SVG is XML or
+// plain text to the standard sniffer, so it is looked for by its root tag.
+func sniffMIME(head []byte) string {
+	mime := http.DetectContentType(head)
+	if i := strings.IndexByte(mime, ';'); i >= 0 {
+		mime = mime[:i]
+	}
+	if (mime == "text/xml" || mime == "text/plain") && bytes.Contains(head, []byte("<svg")) {
+		return "image/svg+xml"
+	}
+	return mime
+}
+
+// ExtensionForMIME is the file extension, without the dot, for an image
+// type Download can report, or "" for a type it does not know.
+func ExtensionForMIME(mime string) string {
+	switch mime {
+	case "image/png":
+		return "png"
+	case "image/jpeg":
+		return "jpg"
+	case "image/gif":
+		return "gif"
+	case "image/webp":
+		return "webp"
+	case "image/bmp":
+		return "bmp"
+	case "image/svg+xml":
+		return "svg"
+	case "application/pdf":
+		return "pdf"
+	default:
+		return ""
+	}
 }

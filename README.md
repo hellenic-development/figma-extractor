@@ -1,317 +1,161 @@
 # Figma Design Extractor
 
-A Go tool to extract design specifications from Figma files using the Figma REST API. This tool automatically extracts colors, typography, spacing, shadows, border radii, and layout specifications from any Figma file and outputs them in a markdown format that can be used to implement the design with AI.
+Reads a Figma file through the Figma REST API and writes its design as markdown that an AI coding assistant can build from: the design tokens the frames really use, the components, a layer tree with layout and text, and the pictures.
 
-## Features
+It is a command-line tool and a Go library. The library is what [Plexon](https://plexon.ai) uses for its Figma tool.
 
-- 🎨 **Color Extraction**: Automatically categorizes colors into primary, secondary, background, text, status, and border colors
-- 📝 **Typography**: Extracts font families, sizes, weights, and line heights
-- 📏 **Spacing**: Identifies spacing patterns and normalizes them to a standard scale
-- 🌈 **Visual Effects**: Extracts shadows and border radii
-- 📐 **Layout Specs**: Captures layout dimensions like header height and sidebar width
-- 🎯 **Node-Specific Extraction**: Extract specific elements or components instead of the entire file
-- 📦 **Multi-Node Support**: Extract multiple nodes in a single operation
-- 🖼️ **Image/Asset Export**: Export images and assets directly from Figma (PNG, SVG, JPG, PDF) with multi-scale support
-- 📄 **Markdown Output**: Generates a comprehensive markdown file with all specifications
+## What it extracts
+
+- Design tokens. The styles the designer named in Figma (`Neutral/Dark/Light`, `Heading/H2`) come first, with their values. Every other colour, text style, spacing value, radius, shadow and gradient follows as the raw value with how often it is used. Nothing is guessed from layer names and nothing is renamed onto a made-up scale.
+- Components. Each component the frames hold instances of, with its variants and description.
+- A layer tree per frame, one layer per line: size, auto layout (direction, gap, padding, alignment, wrap), sizing (fixed, hug, fill), position, fills with alpha, gradients, borders, radii, shadows, blurs, opacity, and the full text with its styled runs.
+- Pictures. A screenshot of each frame, every photo as it was uploaded, each icon as one SVG, and the layers the designer set up for export.
+- An outline. The pages of a file and the frames on them with their ids and sizes, for picking frames before asking for a tree.
+
+Hidden layers are skipped and counted. A group of vector paths is collapsed into one icon line instead of being listed path by path.
 
 ## Installation
 
-The only requirement is the [Go Programming Language](https://go.dev/dl/).
+The only requirement is the [Go Programming Language](https://go.dev/dl/), version 1.27 or newer.
 
 ```bash
 go install github.com/hellenic-development/figma-extractor/cmd/figma-extractor@latest
 ```
 
+## Getting a Figma token
+
+1. Log in to Figma and open **Settings**, then **Security**.
+2. Under **Personal access tokens**, choose **Generate new token**.
+3. Give it the **File content: Read** scope and copy it. Figma shows it once.
+
+Pass it with `--token`, or set `FIGMA_TOKEN` and leave the flag out.
+
 ## Usage
 
-### Basic Usage (Extract Entire File)
+Copy a link to a frame in Figma (right-click the frame, **Copy link to selection**) and pass it:
 
 ```bash
-figma-extractor --url "https://www.figma.com/file/YOUR_FILE_KEY/Design-Name" --token "YOUR_ACCESS_TOKEN"
+figma-extractor \
+  --url "https://www.figma.com/design/FILE_KEY/Name?node-id=12-34" \
+  --component-tree \
+  --export-images
 ```
 
-### Extract Specific Nodes
+This writes `FIGMA_DESIGN_SPECIFICATIONS.md` and a `figma-assets` folder beside it.
 
-Extract one or more specific elements from your Figma file:
+For a file you do not know yet, list its pages and frames first. It is one small request:
 
 ```bash
-# Extract a single node by ID
-figma-extractor \
-  --url "https://www.figma.com/file/YOUR_FILE_KEY/Design" \
-  --token "YOUR_ACCESS_TOKEN" \
-  --node-ids "123:456"
-
-# Extract multiple nodes
-figma-extractor \
-  --url "https://www.figma.com/file/YOUR_FILE_KEY/Design" \
-  --token "YOUR_ACCESS_TOKEN" \
-  --node-ids "123:456,789:012,345:678"
+figma-extractor --url "https://www.figma.com/design/FILE_KEY/Name" --outline
 ```
 
-### Extract from Figma Share Links
-
-The tool automatically detects node IDs from Figma share URLs:
+Then extract the frames you want by id. Ids can be written `12:34` or `12-34`:
 
 ```bash
-# URL with node-id query parameter (most common)
-figma-extractor \
-  --url "https://www.figma.com/file/ABC123/Design?node-id=123:456" \
-  --token "YOUR_ACCESS_TOKEN"
-
-# URL with multiple nodes
-figma-extractor \
-  --url "https://www.figma.com/file/ABC123/Design?node-id=123:456,789:012" \
-  --token "YOUR_ACCESS_TOKEN"
+figma-extractor --url "https://www.figma.com/design/FILE_KEY/Name" --node-ids "12:34,56:78" --component-tree
 ```
 
-### Getting a Figma Personal Access Token
+Without `--component-tree` the output holds the tokens, the components and the list of frames. That is enough for a question like "what colours and type does this design use".
 
-1. Log in to your Figma account
-2. Go to **Settings** → **Account**
-3. Scroll down to **Personal access tokens**
-4. Click **Generate new token**
-5. Give it a name (e.g., "Design Extractor")
-6. Copy the token (you won't be able to see it again)
+A large frame can be cut at a depth. Each layer at the limit says how many children were left out and which id to ask for:
 
+```bash
+figma-extractor --url "..." --component-tree --depth 3
+```
 
 ### Options
 
-- `--url, -u`: Figma file URL (required)
-- `--token, -t`: Figma Personal Access Token (required)
-- `--output, -o`: Output markdown file (default: `FIGMA_DESIGN_SPECIFICATIONS.md`)
-- `--node-ids, -n`: Comma-separated node IDs to extract (optional)
-- `--inherit-context, -i`: Inherit file-level context (colors, styles) when extracting specific nodes (default: false)
-- `--export-images`: Export images/assets from Figma (default: false)
-- `--image-format`: Image format: `png`, `svg`, `jpg`, `pdf` (default: `png`)
-- `--image-scales`: Comma-separated scale factors, e.g. `"1,2,3"` (default: `1`; ignored for SVG/PDF)
-- `--image-dir`: Output directory for exported images (default: `figma-assets`)
+| Flag | Meaning |
+|---|---|
+| `--url`, `-u` | Link to a Figma file or frame. Required. |
+| `--token`, `-t` | Personal access token. Defaults to `$FIGMA_TOKEN`. |
+| `--output`, `-o` | Markdown file to write. Default `FIGMA_DESIGN_SPECIFICATIONS.md`. |
+| `--node-ids`, `-n` | Comma-separated node ids, used instead of the ones in the link. |
+| `--outline` | List the pages and frames instead of extracting a design. |
+| `--component-tree` | Include each frame's layer tree. |
+| `--depth` | Cut each tree this many levels down. `0` keeps everything. |
+| `--export-images` | Save screenshots, photos, icons and exported layers. |
+| `--image-format` | `png`, `jpg`, `svg` or `pdf` for icons and exported layers. Default: SVG for icons, the designer's own setting for exported layers. |
+| `--image-scales` | Scale factors for raster exports, for example `"1,2"`. Default `1`. |
+| `--image-dir` | Folder for the pictures. Default `figma-assets`. |
 
-### Examples
+Links to a file, a frame, a prototype, a FigJam board, a branch and an embed all work. A Community link does not: open it in Figma, copy it to your drafts and use the copy's link.
 
-**Extract entire file:**
+## What the output looks like
+
+```
+frame "Card" #1:2 360x672 col bg=#FFFFFF border="1px #E2E8F0" radius=16 shadow="0 8px 24px -4px #0F172A0D"{Elevation/Card} clip
+  image "Photo" #1:3 360x200 w=fill fit=cover src=photo.jpg radius=16,16,0,0
+  frame "Body" #1:6 360x472 col gap=12 pad=24 w=fill h=hug (+1 hidden)
+    icon "spark" #1:7 16x16 src=spark.svg
+    text "Heading" #1:10 312x96 w=fill font="Inter 600 24/32 ls=-0.24"{Heading/H2} color=#0F172A{Neutral/Ink 900}
+      "Plan the sprint, not the meeting"
+    instance "Button" #1:13 312x48 of="Button" (Size=Large, Type=Primary) row gap=8 pad=0,20 justify=center align=center w=fill bg="linear-gradient(90deg, #4F46E5 0%, #7C3AED 100%)" radius=10
+```
+
+One line is one layer. `{Name}` after a value is the Figma style it comes from. The document opens with a short legend, then the token tables, then one section per frame that stands on its own (link, size, screenshot, files, tree), so a long result can be read in parts.
+
+The same file always gives the same text: there is no timestamp in it and nothing depends on map order.
+
+## What it costs in Figma requests
+
+Figma meters its API. Reading a file or nodes and rendering images are its most expensive tier: about 10 to 20 requests a minute on a Full or Dev seat, and only a handful a month on a View or Collab seat. The tool is built around that:
+
+- A frame is one request. The whole file is never fetched to read a frame.
+- With `--export-images`, one render request per image format in use (usually PNG and SVG), and one cheaper request for all the photos together.
+- An outline is one request.
+- A rate limit that frees in a few seconds is waited out. One that frees in hours comes back at once, as an error that says when.
+
+The command prints how many requests it spent.
+
+## Using it as a Go library
+
+```go
+import (
+	figmaextractor "github.com/hellenic-development/figma-extractor"
+	"github.com/hellenic-development/figma-extractor/pkg/figma"
+)
+
+result, err := figmaextractor.Run(ctx, figmaextractor.Options{
+	AccessToken:   os.Getenv("FIGMA_TOKEN"),
+	FileURL:       "https://www.figma.com/design/FILE_KEY/Name?node-id=12-34",
+	ComponentTree: true,
+	ExportImages:  true,
+	ImageDir:      "figma-assets",
+})
+if err != nil {
+	if figma.KindOf(err) == figma.KindTokenRejected {
+		// ask for a new token
+	}
+	return err
+}
+os.WriteFile("design.md", []byte(result.Markdown), 0o644)
+```
+
+- `Run` stops when its context ends, including the downloads in flight. A stopped download leaves no half-written file.
+- A refusal from Figma is a `*figma.APIError` with a `Kind`: rejected token, missing scope, not found, rate limited (with `RetryAfter`), too large, render failed. Test for it with `figma.KindOf(err)`.
+- A node that is missing, or a picture that could not be rendered or downloaded, does not fail the call. It is a line in `result.Warnings` and in the markdown.
+- `result.Design` holds the frames and tokens as Go values, `result.Assets` the files written, `result.Requests` what the call cost.
+- `FromNodes` builds the same result from a nodes response you already have, without a request.
+- `figma.Client` is usable on its own: `File`, `Nodes`, `Images`, `ImageFills`, `Download`, and a generic `Get` for decoding into your own types. `WithHTTPClient`, `WithBaseURL` and `WithMaxBodyBytes` configure it.
+
+## Testing
+
 ```bash
-figma-extractor \
-  --url "https://www.figma.com/file/abc123xyz/My-Design-System" \
-  --token "figd_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --output "design-specs.md"
+go test -race ./...
 ```
 
-**Extract specific component:**
-```bash
-figma-extractor \
-  --url "https://www.figma.com/file/abc123xyz/My-Design-System" \
-  --token "figd_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --node-ids "123:456" \
-  --output "button-component.md"
-```
+Every test runs against a local test server. Two more are opt-in:
 
-**Extract from share link with node ID:**
-```bash
-figma-extractor \
-  --url "https://www.figma.com/file/abc123xyz/My-Design-System?node-id=123:456" \
-  --token "figd_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --output "component-specs.md"
-```
+- `TestReplay` runs the whole pipeline over answers recorded from a real file, so a change to the output can be judged on a real design without spending requests. Its comment in `replay_test.go` says how to record.
+- `_examples/basic` extracts a real frame. It needs `FIGMA_TOKEN` and spends about five requests: `FIGMA_TOKEN=... go test -v ./_examples/basic/`.
 
-**Extract node with file-level context (colors, styles):**
-```bash
-figma-extractor \
-  --url "https://www.figma.com/file/abc123xyz/My-Design-System?node-id=123:456" \
-  --token "figd_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --inherit-context \
-  --output "component-with-styles.md"
-```
+## Limits
 
-**Extract multiple related components:**
-```bash
-figma-extractor \
-  --url "https://www.figma.com/file/abc123xyz/My-Design-System" \
-  --token "figd_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --node-ids "123:456,789:012,345:678" \
-  --output "button-variants.md"
-```
-
-**Export all assets/images from the entire file as PNG (1x and 2x):**
-```bash
-figma-extractor \
-  --url "https://www.figma.com/file/abc123xyz/My-Design-System" \
-  --token "figd_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --export-images \
-  --image-scales "1,2" \
-  --image-dir "assets"
-```
-
-**Export specific nodes as SVG:**
-```bash
-figma-extractor \
-  --url "https://www.figma.com/file/abc123xyz/My-Design-System" \
-  --token "figd_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --node-ids "123:456,789:012" \
-  --export-images \
-  --image-format svg \
-  --image-dir "icons"
-```
-
-## Output Format
-
-The tool generates a markdown file with the following sections:
-
-### Design System
-- **Color Palette**: All colors categorized by usage (primary, background, text, etc.)
-- **Typography**: Font families, sizes, weights, and line heights
-- **Spacing**: Standardized spacing scale
-- **Border Radius**: Border radius values
-- **Shadows**: Shadow definitions with offsets, blur, and colors
-
-### Layout Specifications
-- Header height
-- Sidebar width
-- Content padding
-- Other layout measurements
-
-### Implementation Notes
-- Instructions for applying the design system
-- Usage examples for Tailwind CSS configuration
-- Guidelines for implementing the design
-
-## How It Works
-
-### Full File Extraction
-
-1. **Authentication**: Connects to the Figma API using your personal access token
-2. **File Retrieval**: Fetches the complete file data including all nodes and styles
-3. **Recursive Extraction**: Traverses the entire document tree and extracts:
-   - Fill colors from all elements
-   - Stroke colors and border properties
-   - Text styles (fonts, sizes, weights)
-   - Layout properties (padding, spacing, dimensions)
-   - Visual effects (shadows, blur)
-4. **Categorization**: Automatically categorizes extracted values based on node names and properties
-5. **Normalization**: Deduplicates and normalizes values to standard scales
-6. **Markdown Generation**: Formats all specifications as CSS variables in a markdown document
-
-### Node-Specific Extraction
-
-1. **Node ID Detection**: Extracts node IDs from the URL or `--node-ids` flag
-   - Supports query parameter format: `?node-id=123:456`
-   - Supports URL-encoded format: `?node-id=123-456`
-   - Supports multiple nodes: `?node-id=123:456,789:012`
-2. **Targeted Fetch**: Fetches only the specified nodes using the Figma `/nodes` API endpoint
-3. **Smart Extraction**: Extracts specifications from target nodes and their children
-4. **Optional Context Inheritance**: Use `--inherit-context` flag to include:
-   - Published styles and colors from document root
-   - Global typography definitions
-   - File-level design tokens
-5. **Normalization & Deduplication**: Normalizes values to standard scales
-6. **Markdown Output**: Generates the same comprehensive markdown format
-
-**Benefits of Node Extraction:**
-- ⚡ **Faster**: Only fetches and processes specific elements
-- 🎯 **Focused**: Perfect for extracting individual components or screens
-- 📦 **Efficient**: Works great with large Figma files
-- 🔗 **Convenient**: Works directly with Figma share links
-- 🎛️ **Flexible**: Choose whether to include file-level context or not
-
-### Image/Asset Export
-
-1. **Opt-in**: Enabled via the `--export-images` flag
-2. **Node Discovery**:
-   - **Full file mode**: Automatically discovers all nodes that have export settings defined by the designer in Figma
-   - **Node-specific mode**: Exports the targeted nodes directly
-3. **Batched API Requests**: Sends node IDs to the Figma Images API in batches of 100 for efficiency
-4. **Concurrent Downloads**: Downloads images in parallel (up to 5 at a time) for speed
-5. **Smart Naming**: Generates kebab-case filenames from node names, with `@2x`/`@3x` suffixes for raster scales > 1 and automatic deduplication of colliding names
-6. **Multi-Format**: Supports PNG, SVG, JPG, and PDF output formats
-7. **Multi-Scale**: Generate multiple scale variants (e.g., 1x, 2x, 3x) in a single run; scale is ignored for vector formats (SVG/PDF)
-8. **Integrated Output**: Exported asset info is included in the generated markdown file
-
-## Integration with Claude
-
-The generated markdown file is specifically formatted to work with [Claude Sonnet 4.5](https://claude.ai), [ChatGPT](https://chatgpt.com/) and e.t.c. for implementing the design. Simply provide the generated markdown file to AI along with your implementation request, and it will use the exact specifications to build your UI.
-
-## Example Output
-
-The tool generates CSS variables like:
-
-```css
-/* Primary Colors */
---color-primary-main: #3B82F6;
---color-primary-hover: #2563EB;
-
-/* Background Colors */
---color-bg-main: #FFFFFF;
---color-bg-surface: #F9FAFB;
-
-/* Typography */
---font-primary: 'Inter', system-ui, -apple-system, sans-serif;
---text-base: 16px;
---text-lg: 18px;
---font-medium: 500;
---font-semibold: 600;
-
-/* Spacing */
---space-4: 16px;
---space-6: 24px;
---space-8: 32px;
-
-/* Border Radius */
---radius-md: 6px;
---radius-lg: 8px;
-```
-
-## Node ID Formats
-
-The tool supports all common Figma URL formats for node identification:
-
-### Query Parameter (Most Common)
-```
-https://www.figma.com/file/ABC123/Design?node-id=123:456
-https://www.figma.com/design/ABC123/Design?node-id=123-456  (URL-encoded colon)
-```
-
-### Multiple Nodes
-```
-https://www.figma.com/file/ABC123/Design?node-id=123:456,789:012
-```
-
-### Hash Fragment
-```
-https://www.figma.com/file/ABC123/Design#123:456
-```
-
-### Finding Node IDs
-
-To find a node ID in Figma:
-1. Right-click on any element in Figma
-2. Select "Copy link to selection"
-3. The copied URL will contain the node ID in the format shown above
-4. Use that URL directly with figma-extractor
-
-## Limitations
-
-- Requires a valid Figma Personal Access Token
-- Can only access files you have permission to view
-- Color categorization is based on node naming conventions
-- Very large files may take longer to process (use node extraction for better performance)
-- Node IDs must exist in the specified file
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
-
-## License
-
-MIT License - feel free to use this tool in your projects.
-
-## Support
-
-If you encounter any issues:
-1. Verify your Figma token is valid
-2. Ensure you have access to the Figma file
-3. Check that the file URL is correct
-4. Review the error messages for specific issues
-
-For additional help, please open an issue on GitHub.
+- Figma variables are not read. Their names need an endpoint only Enterprise tokens may call. Values still arrive inline on the layers.
+- Vector paths are not written out. An icon is exported as an SVG file instead.
+- A render is capped by Figma at 32 megapixels and scaled down past that. The pixel sizes in the output are read from the saved files.
+- A very large page can produce a very large tree. Use `--outline` and then single frames, or `--depth`.
 
 ## License
 

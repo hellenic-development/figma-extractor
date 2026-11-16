@@ -1,8 +1,9 @@
 package figmaextractor
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,18 +14,60 @@ import (
 	"github.com/hellenic-development/figma-extractor/pkg/imager"
 )
 
-// Options configures the extraction.
+var (
+	// ErrNodesNotFound is returned when none of the nodes asked for is in
+	// the file. The error names them.
+	ErrNodesNotFound = errors.New("the file has no such node")
+	// ErrInvalidOption is returned for an option outside what Figma accepts.
+	ErrInvalidOption = errors.New("invalid option")
+)
+
+// Options configures an extraction.
 type Options struct {
-	AccessToken        string
-	FileURL            string    // Figma file URL
-	NodeIDs            []string  // empty = entire file
-	InheritFileContext bool
-	ExportImages       bool
-	ImageFormat        string    // "png", "svg", "jpg", "pdf"
-	ImageScales        []float64
-	ImageDir           string
-	ComponentTree      bool
-	Logger             Logger // nil = no logging
+	// AccessToken is a Figma personal access token. It is ignored when
+	// Client is set.
+	AccessToken string
+	// FileURL is a link to a Figma file, a frame or a prototype.
+	FileURL string
+	// NodeIDs are the nodes to extract, in any form ("12:34", "12-34").
+	// When empty, the nodes the link selects are used, and when the link
+	// selects none, the whole file.
+	NodeIDs []string
+
+	// Outline returns the map of the file (its pages and the frames on
+	// them, with ids and sizes) instead of a design. It is one cheap
+	// request and the way to pick frames in a file too large to read whole.
+	Outline bool
+
+	// ComponentTree includes each frame's layer tree. Without it the result
+	// holds the tokens, the components and the list of frames.
+	ComponentTree bool
+	// Depth cuts each frame's tree this many levels down. A layer at the
+	// limit says how many children were left out. 0 keeps everything.
+	Depth int
+
+	// ExportImages saves a screenshot of each frame, the original photos,
+	// the icons as SVG and the layers the designer set up for export.
+	ExportImages bool
+	// ImageFormat, when set (png, jpg, svg or pdf), replaces the format
+	// each icon and exported layer would get on its own.
+	ImageFormat string
+	// ImageScales are the scale factors for raster exports, between 0.01
+	// and 4. [1] when empty.
+	ImageScales []float64
+	// ImageDir is where the files go, "figma-assets" when empty.
+	ImageDir string
+	// MaxImageBytes refuses a single download above this size. 0 is no
+	// limit.
+	MaxImageBytes int64
+
+	// Client is the Figma client to use: one with its own HTTP client,
+	// size caps or base URL, or one shared with other calls so the request
+	// counts add up. A new client for AccessToken is made when it is nil.
+	Client *figma.Client
+
+	// Logger receives progress messages. nil is silent.
+	Logger Logger
 }
 
 // Logger receives progress messages. A nil Logger means silent operation.
@@ -34,11 +77,32 @@ type Logger interface {
 	Errorf(format string, args ...any)
 }
 
-// Result contains the extraction output.
+// Result is what an extraction produced.
 type Result struct {
-	Specs    *extractor.DesignSpecs
-	FileName string // Figma file name
-	Markdown string // formatted markdown output
+	// Markdown is the document for a reader, a coding model above all.
+	Markdown string
+
+	FileName     string
+	FileKey      string
+	LastModified string
+	Version      string
+	// NodeIDs are the nodes that were asked for, in colon form.
+	NodeIDs []string
+
+	// Design is set for a design extraction, Outline for an outline.
+	Design  *extractor.Design
+	Outline *extractor.Outline
+	// Assets are the files ExportImages wrote, and AssetDir the folder they
+	// are in, with forward slashes. The markdown names the folder once per
+	// frame and refers to each file by its name.
+	Assets   []imager.Asset
+	AssetDir string
+	// Warnings are the things that went wrong without failing the call: a
+	// node that is not in the file, a picture Figma could not render. They
+	// are also printed in Markdown.
+	Warnings []string
+	// Requests counts what this call sent to Figma, by rate-limit tier.
+	Requests figma.RequestStats
 }
 
 func (o *Options) logInfo(f string, a ...any) {
@@ -53,364 +117,205 @@ func (o *Options) logWarn(f string, a ...any) {
 	}
 }
 
-func (o *Options) logError(f string, a ...any) {
-	if o.Logger != nil {
-		o.Logger.Errorf(f, a...)
+func (o *Options) validate() error {
+	switch strings.ToLower(o.ImageFormat) {
+	case "", "png", "jpg", "svg", "pdf":
+	default:
+		return fmt.Errorf("%w: image format %q is not png, jpg, svg or pdf", ErrInvalidOption, o.ImageFormat)
 	}
-}
-
-// Run executes the Figma extraction pipeline and returns the result.
-func Run(opts Options) (*Result, error) {
-	// Apply defaults.
-	if opts.ImageFormat == "" {
-		opts.ImageFormat = "png"
-	}
-	if opts.ImageDir == "" {
-		opts.ImageDir = "figma-assets"
-	}
-	if len(opts.ImageScales) == 0 {
-		opts.ImageScales = []float64{1}
-	}
-
-	// Extract file key from URL.
-	opts.logInfo("Extracting file key from URL...")
-	fileKey, err := figma.ExtractFileKey(opts.FileURL)
-	if err != nil {
-		return nil, fmt.Errorf("extract file key: %w", err)
-	}
-	opts.logInfo("File key: %s", fileKey)
-
-	// Extract node IDs from URL or merge with explicit ones.
-	var targetNodeIDs []string
-	if len(opts.NodeIDs) > 0 {
-		opts.logInfo("Using %d explicit node ID(s)", len(opts.NodeIDs))
-		targetNodeIDs = opts.NodeIDs
-	} else {
-		opts.logInfo("Checking URL for node IDs...")
-		urlNodeIDs, err := figma.ExtractNodeIDs(opts.FileURL)
-		if err != nil {
-			return nil, fmt.Errorf("extract node IDs from URL: %w", err)
-		}
-		if len(urlNodeIDs) > 0 {
-			targetNodeIDs = urlNodeIDs
-			opts.logInfo("Found %d node(s) in URL", len(targetNodeIDs))
-		} else {
-			opts.logInfo("No node IDs found, will extract entire file")
+	for _, s := range o.ImageScales {
+		if s < 0.01 || s > 4 {
+			return fmt.Errorf("%w: image scale %g is outside Figma's range of 0.01 to 4", ErrInvalidOption, s)
 		}
 	}
-
-	// Create Figma client.
-	opts.logInfo("Authenticating with Figma API...")
-	client := figma.NewClient(opts.AccessToken)
-
-	var specs *extractor.DesignSpecs
-	var fileName string
-	var fileResp *figma.FileResponse
-	var nodesResp *figma.NodesResponse
-
-	// Choose extraction strategy based on whether node IDs are provided.
-	if len(targetNodeIDs) > 0 {
-		opts.logInfo("Extracting %d specific node(s)...", len(targetNodeIDs))
-
-		opts.logInfo("Fetching nodes from Figma...")
-		nodesResp, err = client.GetFileNodes(fileKey, targetNodeIDs)
-		if err != nil {
-			return nil, fmt.Errorf("fetch nodes: %w", err)
-		}
-		opts.logInfo("Retrieved %d node(s)", len(nodesResp.Nodes))
-
-		opts.logInfo("Fetching file metadata...")
-		fileResp, err = client.GetFile(fileKey)
-		if err != nil {
-			return nil, fmt.Errorf("fetch file metadata: %w", err)
-		}
-		opts.logInfo("File: %s", fileResp.Name)
-		fileName = fileResp.Name
-
-		opts.logInfo("Extracting design specifications from nodes...")
-		specs = extractor.ExtractNodes(fileResp, nodesResp, targetNodeIDs, opts.InheritFileContext)
-	} else {
-		opts.logInfo("Extracting entire file...")
-
-		opts.logInfo("Fetching file data from Figma...")
-		fileResp, err = client.GetFile(fileKey)
-		if err != nil {
-			return nil, fmt.Errorf("fetch file: %w", err)
-		}
-		opts.logInfo("File: %s", fileResp.Name)
-		fileName = fileResp.Name
-
-		opts.logInfo("Extracting design specifications...")
-		specs = extractor.Extract(fileResp)
+	if o.Depth < 0 {
+		return fmt.Errorf("%w: depth %d is negative", ErrInvalidOption, o.Depth)
 	}
-
-	// Image export (opt-in).
-	if opts.ExportImages {
-		if err := exportImages(&opts, client, fileKey, specs, fileResp, nodesResp, targetNodeIDs); err != nil {
-			return nil, err
-		}
-	}
-
-	// Component tree is opt-in.
-	if opts.ComponentTree {
-		extractor.AttachAssetsToNodeTree(specs.NodeTree, specs.ExportedAssets)
-	} else {
-		specs.NodeTree = nil
-	}
-
-	// Format as markdown.
-	opts.logInfo("Generating markdown documentation...")
-	markdown := formatter.ToMarkdown(specs, fileName, opts.ImageDir)
-
-	return &Result{
-		Specs:    specs,
-		FileName: fileName,
-		Markdown: markdown,
-	}, nil
-}
-
-// exportImages handles the full image export pipeline: screenshot, ExportSettings nodes,
-// IMAGE fills, render fallback, and deduplication.
-func exportImages(opts *Options, client *figma.Client, fileKey string, specs *extractor.DesignSpecs, fileResp *figma.FileResponse, nodesResp *figma.NodesResponse, targetNodeIDs []string) error {
-	// Validate format.
-	validFormats := map[string]bool{"png": true, "svg": true, "jpg": true, "pdf": true}
-	if !validFormats[opts.ImageFormat] {
-		return fmt.Errorf("invalid image format %q (must be png, svg, jpg, or pdf)", opts.ImageFormat)
-	}
-
-	// Validate scales.
-	for _, s := range opts.ImageScales {
-		if s <= 0 {
-			return fmt.Errorf("scale value must be positive, got %g", s)
-		}
-	}
-
-	config := imager.ExportConfig{
-		Format:    opts.ImageFormat,
-		Scales:    opts.ImageScales,
-		OutputDir: opts.ImageDir,
-	}
-
-	// Screenshot: render the target node(s) (or full document) as a complete design screenshot.
-	screenshotName := "complete_design_screenshot." + config.Format
-	screenshotNodes := make(map[string]string) // nodeID -> nodeName
-
-	if len(targetNodeIDs) > 0 {
-		for _, id := range targetNodeIDs {
-			if nd, ok := nodesResp.Nodes[id]; ok {
-				screenshotNodes[id] = nd.Document.Name
-				for _, child := range nd.Document.Children {
-					screenshotNodes[child.ID] = child.Name
-				}
-			}
-		}
-	} else {
-		screenshotNodes[fileResp.Document.ID] = fileResp.Document.Name
-		for _, child := range fileResp.Document.Children {
-			screenshotNodes[child.ID] = child.Name
-		}
-	}
-
-	opts.logInfo("Capturing design screenshot to %s...", screenshotName)
-	screenshotResult, err := imager.ExportImages(client, fileKey, screenshotNodes, imager.ExportConfig{
-		Format:    config.Format,
-		Scales:    []float64{1},
-		OutputDir: config.OutputDir,
-	})
-	if err != nil {
-		opts.logWarn("Screenshot failed: %v", err)
-	} else {
-		for _, asset := range screenshotResult.Assets {
-			oldPath := filepath.Join(config.OutputDir, asset.FileName)
-			newPath := filepath.Join(config.OutputDir, screenshotName)
-			if err := os.Rename(oldPath, newPath); err != nil {
-				opts.logWarn("Could not rename screenshot: %v", err)
-				specs.ExportedAssets = append(specs.ExportedAssets, extractor.ExportedAssetInfo{
-					NodeID:       asset.NodeID,
-					NodeName:     asset.NodeName,
-					FileName:     asset.FileName,
-					Format:       asset.Format,
-					Scale:        asset.Scale,
-					IsScreenshot: true,
-				})
-			} else {
-				specs.ExportedAssets = append(specs.ExportedAssets, extractor.ExportedAssetInfo{
-					NodeID:       asset.NodeID,
-					NodeName:     asset.NodeName,
-					FileName:     screenshotName,
-					Format:       asset.Format,
-					Scale:        asset.Scale,
-					IsScreenshot: true,
-				})
-			}
-		}
-	}
-
-	// Phase 1: Collect and export nodes with ExportSettings via render API.
-	exportNodes := make(map[string]string)
-
-	if len(targetNodeIDs) > 0 {
-		opts.logInfo("Discovering exportable child nodes...")
-		for _, id := range targetNodeIDs {
-			if nd, ok := nodesResp.Nodes[id]; ok {
-				childExport := imager.CollectExportableNodes(&nd.Document)
-				for cID, cName := range childExport {
-					if _, isRoot := screenshotNodes[cID]; isRoot {
-						continue
-					}
-					exportNodes[cID] = cName
-				}
-			}
-		}
-		if len(exportNodes) == 0 {
-			opts.logInfo("No additional exportable child nodes")
-		} else {
-			opts.logInfo("Found %d exportable child node(s)", len(exportNodes))
-		}
-	} else {
-		opts.logInfo("Discovering exportable nodes...")
-		exportNodes = imager.CollectExportableNodes(&fileResp.Document)
-		delete(exportNodes, fileResp.Document.ID)
-		if len(exportNodes) == 0 {
-			opts.logInfo("No additional exportable nodes")
-		} else {
-			opts.logInfo("Found %d exportable node(s)", len(exportNodes))
-		}
-	}
-
-	if len(exportNodes) > 0 {
-		opts.logInfo("Exporting rendered images to %s...", opts.ImageDir)
-		result, err := imager.ExportImages(client, fileKey, exportNodes, config)
-		if err != nil {
-			return fmt.Errorf("export images: %w", err)
-		}
-		opts.logInfo("Exported %d image(s)", len(result.Assets))
-
-		for _, dlErr := range result.Errors {
-			opts.logWarn("%v", dlErr)
-		}
-
-		for _, asset := range result.Assets {
-			specs.ExportedAssets = append(specs.ExportedAssets, extractor.ExportedAssetInfo{
-				NodeID:   asset.NodeID,
-				NodeName: asset.NodeName,
-				FileName: asset.FileName,
-				Format:   asset.Format,
-				Scale:    asset.Scale,
-			})
-		}
-	}
-
-	// Phase 2: Collect and export embedded IMAGE fill nodes via file images API.
-	var roots []*figma.Node
-	if len(targetNodeIDs) > 0 {
-		for _, id := range targetNodeIDs {
-			if nd, ok := nodesResp.Nodes[id]; ok {
-				doc := nd.Document // copy
-				roots = append(roots, &doc)
-			}
-		}
-	} else {
-		roots = append(roots, &fileResp.Document)
-	}
-
-	var allImageFills []imager.ImageFillNode
-	for _, root := range roots {
-		for _, fill := range imager.CollectImageFillNodes(root) {
-			if _, isScreenshot := screenshotNodes[fill.NodeID]; isScreenshot {
-				continue
-			}
-			allImageFills = append(allImageFills, fill)
-		}
-	}
-
-	if len(allImageFills) > 0 {
-		opts.logInfo("Found %d embedded image(s), fetching download URLs...", len(allImageFills))
-		var unresolvedNodes []imager.ImageFillNode
-
-		fileImagesResp, err := client.GetFileImages(fileKey)
-		if err != nil {
-			opts.logWarn("File images API failed: %v", err)
-			unresolvedNodes = allImageFills
-		} else {
-			opts.logInfo("Downloading embedded images to %s...", opts.ImageDir)
-			fillResult, err := imager.ExportImageFills(fileImagesResp, allImageFills, config)
-			if err != nil {
-				return fmt.Errorf("export image fills: %w", err)
-			}
-
-			if len(fillResult.Assets) > 0 {
-				opts.logInfo("Exported %d embedded image(s)", len(fillResult.Assets))
-			}
-
-			for _, dlErr := range fillResult.Errors {
-				opts.logWarn("%v", dlErr)
-			}
-
-			for _, asset := range fillResult.Assets {
-				specs.ExportedAssets = append(specs.ExportedAssets, extractor.ExportedAssetInfo{
-					NodeID:   asset.NodeID,
-					NodeName: asset.NodeName,
-					FileName: asset.FileName,
-					Format:   asset.Format,
-					Scale:    asset.Scale,
-				})
-			}
-
-			unresolvedNodes = fillResult.UnresolvedNodes
-		}
-
-		// Fallback: render unresolved IMAGE fill nodes via the render API.
-		if len(unresolvedNodes) > 0 {
-			opts.logInfo("Rendering %d image(s) via render API (no file image URLs)...", len(unresolvedNodes))
-			renderNodes := imager.ImageFillNodesToMap(unresolvedNodes)
-			for id := range screenshotNodes {
-				delete(renderNodes, id)
-			}
-			renderResult, err := imager.ExportImages(client, fileKey, renderNodes, config)
-			if err != nil {
-				opts.logError("Rendering images failed: %v", err)
-				// Non-fatal: continue.
-			} else {
-				opts.logInfo("Rendered %d image(s)", len(renderResult.Assets))
-
-				for _, dlErr := range renderResult.Errors {
-					opts.logWarn("%v", dlErr)
-				}
-
-				for _, asset := range renderResult.Assets {
-					specs.ExportedAssets = append(specs.ExportedAssets, extractor.ExportedAssetInfo{
-						NodeID:   asset.NodeID,
-						NodeName: asset.NodeName,
-						FileName: asset.FileName,
-						Format:   asset.Format,
-						Scale:    asset.Scale,
-					})
-				}
-			}
-		}
-	}
-
-	// Remove non-screenshot assets that duplicate a screenshot node.
-	if len(screenshotNodes) > 0 {
-		excludeIDs := make(map[string]bool, len(screenshotNodes))
-		excludeNames := make(map[string]bool, len(screenshotNodes))
-		for id, name := range screenshotNodes {
-			excludeIDs[id] = true
-			excludeNames[name] = true
-		}
-		filtered := specs.ExportedAssets[:0]
-		for _, a := range specs.ExportedAssets {
-			if !a.IsScreenshot && (excludeIDs[a.NodeID] || excludeNames[a.NodeName]) {
-				os.Remove(filepath.Join(opts.ImageDir, a.FileName))
-				continue
-			}
-			filtered = append(filtered, a)
-		}
-		specs.ExportedAssets = filtered
-	}
-
 	return nil
+}
+
+// Run reads a Figma file and returns its design, or its outline.
+//
+// It spends as few requests as it can, because Figma counts them against a
+// small allowance: one request for the nodes (or the file), and with
+// ExportImages one more per image format in use plus a single cheap one for
+// the photos. Everything stops when ctx ends.
+//
+// A node that is missing, or a picture that could not be rendered or
+// downloaded, does not fail the call: it is a line in Result.Warnings. The
+// error is for what leaves nothing to return: a bad link, a refused token
+// (a *figma.APIError, see figma.KindOf), no node found at all, or ctx
+// ending.
+func Run(ctx context.Context, opts Options) (*Result, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+	ref, err := figma.ParseURL(opts.FileURL)
+	if err != nil {
+		return nil, err
+	}
+	ids := figma.NormalizeNodeIDs(opts.NodeIDs)
+	if len(ids) == 0 {
+		ids = ref.NodeIDs
+	}
+	client := opts.Client
+	if client == nil {
+		client = figma.NewClient(opts.AccessToken)
+	}
+	before := client.Requests()
+
+	res := &Result{FileKey: ref.FileKey, NodeIDs: ids}
+	if opts.Outline {
+		err = runOutline(ctx, client, &opts, res)
+	} else {
+		err = runDesign(ctx, client, &opts, res)
+	}
+	after := client.Requests()
+	res.Requests = figma.RequestStats{Tier1: after.Tier1 - before.Tier1, Tier2: after.Tier2 - before.Tier2, Tier3: after.Tier3 - before.Tier3}
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range res.Warnings {
+		opts.logWarn("%s", w)
+	}
+	return res, nil
+}
+
+func runOutline(ctx context.Context, client *figma.Client, opts *Options, res *Result) error {
+	// Two levels below a requested node, three below the document: the
+	// frames and a count of what is directly inside each.
+	if len(res.NodeIDs) > 0 {
+		opts.logInfo("Reading the outline of %d node(s) from Figma", len(res.NodeIDs))
+		resp, err := client.Nodes(ctx, res.FileKey, res.NodeIDs, figma.NodesQuery{Depth: 2})
+		if err != nil {
+			return err
+		}
+		res.FileName, res.LastModified, res.Version = resp.Name, resp.LastModified, resp.Version
+		src, err := sourceOf(resp, res)
+		if err != nil {
+			return err
+		}
+		res.Outline = extractor.BuildOutline(src.Roots, 2)
+	} else {
+		opts.logInfo("Reading the file's outline from Figma")
+		file, err := client.File(ctx, res.FileKey, figma.FileQuery{Depth: 3})
+		if err != nil {
+			return err
+		}
+		res.FileName, res.LastModified, res.Version = file.Name, file.LastModified, file.Version
+		res.Outline = extractor.BuildOutline([]*figma.Node{&file.Document}, 3)
+	}
+	res.Markdown = formatter.OutlineMarkdown(formatter.OutlineDoc{
+		FileName: res.FileName, FileKey: res.FileKey, LastModified: res.LastModified,
+		Outline: res.Outline, Warnings: res.Warnings,
+	})
+	return nil
+}
+
+func runDesign(ctx context.Context, client *figma.Client, opts *Options, res *Result) error {
+	var src extractor.Source
+	if len(res.NodeIDs) > 0 {
+		opts.logInfo("Reading %d node(s) from Figma", len(res.NodeIDs))
+		resp, err := client.Nodes(ctx, res.FileKey, res.NodeIDs, figma.NodesQuery{Depth: fetchDepth(opts.Depth)})
+		if err != nil {
+			return err
+		}
+		res.FileName, res.LastModified, res.Version = resp.Name, resp.LastModified, resp.Version
+		if src, err = sourceOf(resp, res); err != nil {
+			return err
+		}
+	} else {
+		opts.logInfo("Reading the whole file from Figma")
+		file, err := client.File(ctx, res.FileKey, figma.FileQuery{Depth: fetchDepth(opts.Depth)})
+		if err != nil {
+			return err
+		}
+		res.FileName, res.LastModified, res.Version = file.Name, file.LastModified, file.Version
+		src = extractor.SourceFromFile(file)
+	}
+
+	res.Design = extractor.Build(src, extractor.Options{Depth: opts.Depth})
+	if len(res.Design.Frames) == 0 {
+		res.Warnings = append(res.Warnings, "Nothing visible was found in what was asked for.")
+	}
+
+	if opts.ExportImages && len(res.Design.Frames) > 0 {
+		dir := opts.ImageDir
+		if dir == "" {
+			dir = "figma-assets"
+		}
+		opts.logInfo("Saving pictures to %s", dir)
+		exported, err := imager.Export(ctx, client, res.FileKey, res.Design, imager.Config{
+			Dir: dir, Scales: opts.ImageScales, Format: opts.ImageFormat, MaxFileBytes: opts.MaxImageBytes,
+		})
+		switch {
+		case err != nil && ctx.Err() != nil:
+			return fmt.Errorf("the extraction was stopped: %w", ctx.Err())
+		case err != nil:
+			// The design is already in hand; losing the pictures is not
+			// worth losing it too.
+			res.Warnings = append(res.Warnings, fmt.Sprintf("The pictures could not be saved: %v.", err))
+		default:
+			res.Assets, res.AssetDir = exported.Assets, filepath.ToSlash(dir)
+			res.Warnings = append(res.Warnings, exported.Warnings...)
+		}
+	}
+
+	res.Markdown = markdownOf(res, opts)
+	return nil
+}
+
+func markdownOf(res *Result, opts *Options) string {
+	return formatter.Markdown(formatter.Doc{
+		FileName: res.FileName, FileKey: res.FileKey, LastModified: res.LastModified,
+		Design: res.Design, Assets: res.Assets, AssetDir: res.AssetDir, Warnings: res.Warnings, Tree: opts.ComponentTree,
+	})
+}
+
+// fetchDepth is how deep to ask Figma for when the tree is cut at depth. It
+// is deeper than the cut: the frames may sit under a page and a section,
+// the layers at the cut need their children counted, and telling an icon
+// from a frame takes a look inside it.
+func fetchDepth(depth int) int {
+	if depth <= 0 {
+		return 0
+	}
+	return depth + 5
+}
+
+// sourceOf gathers the requested nodes of a response, turning the ones the
+// file does not have into warnings, or into the error when it has none.
+func sourceOf(resp *figma.NodesResponse, res *Result) (extractor.Source, error) {
+	src, missing := extractor.SourceFromNodes(resp, res.NodeIDs)
+	if len(src.Roots) == 0 {
+		return src, fmt.Errorf("%w: %s", ErrNodesNotFound, strings.Join(missing, ", "))
+	}
+	for _, id := range missing {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("Node %s is not in this file.", id))
+	}
+	return src, nil
+}
+
+// FromNodes builds a design from a nodes response that was already fetched,
+// without sending a request. It is for a caller that needs the same answer
+// for something else too and should not pay for it twice. fileKey is used
+// for the links in the markdown. The image options are ignored: nothing is
+// downloaded.
+func FromNodes(resp *figma.NodesResponse, fileKey string, ids []string, opts Options) (*Result, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+	res := &Result{
+		FileKey: fileKey, NodeIDs: figma.NormalizeNodeIDs(ids),
+		FileName: resp.Name, LastModified: resp.LastModified, Version: resp.Version,
+	}
+	src, err := sourceOf(resp, res)
+	if err != nil {
+		return nil, err
+	}
+	res.Design = extractor.Build(src, extractor.Options{Depth: opts.Depth})
+	res.Markdown = markdownOf(res, &opts)
+	return res, nil
 }
 
 // ParseScales parses a comma-separated string of scale factors into a float64 slice.

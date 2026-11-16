@@ -31,3 +31,6 @@ design-specs.md
 # Environment files
 .env
 .env.local
+
+# Internal plans and working notes. Never published.
+docs/
